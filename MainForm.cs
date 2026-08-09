@@ -12,9 +12,13 @@ internal sealed class MainForm : Form
     private readonly TextBox _urlTextBox;
     private readonly TimeInput _startTimeInput;
     private readonly TimeInput _endTimeInput;
+    private readonly Label _endTimeLabel;
+    private readonly CheckBox _useDurationCheckBox;
     private readonly Button _clipButton;
     private readonly Label _statusLabel;
     private bool _isBusy;
+    private bool _updatingTimeInputs;
+    private string? _lastAppliedUrlTimestamp;
 
     public MainForm()
     {
@@ -32,6 +36,7 @@ internal sealed class MainForm : Form
         _urlTextBox = CreateTextBox(24, 43, 512, 0);
         _urlTextBox.PlaceholderText = "https://www.twitch.tv/videos/... or .../clip/...";
         _urlTextBox.AccessibleName = "Twitch VOD or clip link";
+        _urlTextBox.TextChanged += UrlTextBox_TextChanged;
 
         var startLabel = CreateLabel("Start time", 24, 96, 248);
         _startTimeInput = new TimeInput("Start time", TimeSpan.Zero)
@@ -40,12 +45,29 @@ internal sealed class MainForm : Form
             TabIndex = 1
         };
 
-        var endLabel = CreateLabel("End time", 288, 96, 248);
+        _endTimeLabel = CreateLabel("End time", 288, 96, 96);
         _endTimeInput = new TimeInput("End time", TimeSpan.FromSeconds(30))
         {
             Location = new Point(288, 119),
             TabIndex = 2
         };
+
+        _useDurationCheckBox = new CheckBox
+        {
+            Text = "Use duration",
+            Location = new Point(392, 89),
+            Size = new Size(144, 30),
+            CheckAlign = ContentAlignment.MiddleLeft,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = MutedTextColor,
+            Cursor = Cursors.Hand,
+            AccessibleDescription = "Switch the right-hand time input between an end time and a duration.",
+            TabIndex = 3
+        };
+
+        _startTimeInput.ValueChanged += StartTimeInput_ValueChanged;
+        _endTimeInput.ValueChanged += EndTimeInput_ValueChanged;
+        _useDurationCheckBox.CheckedChanged += UseDurationCheckBox_CheckedChanged;
 
         var timeHint = new Label
         {
@@ -58,7 +80,7 @@ internal sealed class MainForm : Form
 
         _clipButton = new Button
         {
-            Text = "Clip MP3",
+            Text = "Download & trim",
             Location = new Point(24, 190),
             Size = new Size(512, 44),
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
@@ -68,8 +90,8 @@ internal sealed class MainForm : Form
             Font = new Font("Segoe UI Semibold", 10F, FontStyle.Bold, GraphicsUnit.Point),
             Cursor = Cursors.Hand,
             UseVisualStyleBackColor = false,
-            AccessibleName = "Clip MP3",
-            TabIndex = 3
+            AccessibleName = "Download and trim MP3",
+            TabIndex = 4
         };
         _clipButton.FlatAppearance.BorderSize = 0;
         _clipButton.FlatAppearance.MouseOverBackColor = AccentHoverColor;
@@ -95,7 +117,8 @@ internal sealed class MainForm : Form
             _urlTextBox,
             startLabel,
             _startTimeInput,
-            endLabel,
+            _endTimeLabel,
+            _useDurationCheckBox,
             _endTimeInput,
             timeHint,
             _clipButton,
@@ -103,6 +126,111 @@ internal sealed class MainForm : Form
         ]);
 
         AcceptButton = _clipButton;
+    }
+
+    private void UrlTextBox_TextChanged(object? sender, EventArgs e)
+    {
+        if (!TryGetTwitchMedia(
+                _urlTextBox.Text,
+                out var canonicalUrl,
+                out _,
+                out var linkedStart)
+            || linkedStart is null)
+        {
+            _lastAppliedUrlTimestamp = null;
+            return;
+        }
+
+        var timestampKey = $"{canonicalUrl}|{linkedStart.Value.Ticks}";
+        if (timestampKey == _lastAppliedUrlTimestamp)
+        {
+            return;
+        }
+
+        _lastAppliedUrlTimestamp = timestampKey;
+        _updatingTimeInputs = true;
+        try
+        {
+            _startTimeInput.Value = linkedStart.Value;
+            if (!_useDurationCheckBox.Checked)
+            {
+                _endTimeInput.Value = linkedStart.Value;
+            }
+        }
+        finally
+        {
+            _updatingTimeInputs = false;
+        }
+
+        SetStatus("Start time loaded from the Twitch link.", MutedTextColor);
+    }
+
+    private void StartTimeInput_ValueChanged(object? sender, EventArgs e)
+    {
+        if (_updatingTimeInputs || _useDurationCheckBox.Checked)
+        {
+            return;
+        }
+
+        KeepEndAtOrAfterStart();
+    }
+
+    private void EndTimeInput_ValueChanged(object? sender, EventArgs e)
+    {
+        if (_updatingTimeInputs || _useDurationCheckBox.Checked)
+        {
+            return;
+        }
+
+        KeepEndAtOrAfterStart();
+    }
+
+    private void KeepEndAtOrAfterStart()
+    {
+        if (_endTimeInput.Value >= _startTimeInput.Value)
+        {
+            return;
+        }
+
+        _updatingTimeInputs = true;
+        try
+        {
+            _endTimeInput.Value = _startTimeInput.Value;
+        }
+        finally
+        {
+            _updatingTimeInputs = false;
+        }
+    }
+
+    private void UseDurationCheckBox_CheckedChanged(object? sender, EventArgs e)
+    {
+        _updatingTimeInputs = true;
+        try
+        {
+            if (_useDurationCheckBox.Checked)
+            {
+                var duration = _endTimeInput.Value - _startTimeInput.Value;
+                _endTimeInput.Value = duration > TimeSpan.Zero
+                    ? duration
+                    : TimeSpan.FromSeconds(30);
+                _endTimeLabel.Text = "Duration";
+                _endTimeInput.SetAccessibleName("Duration");
+            }
+            else
+            {
+                var end = _startTimeInput.Value + _endTimeInput.Value;
+                _endTimeInput.Value = end <= TimeInput.MaximumValue
+                    ? end
+                    : TimeInput.MaximumValue;
+                _endTimeLabel.Text = "End time";
+                _endTimeInput.SetAccessibleName("End time");
+            }
+        }
+        finally
+        {
+            _updatingTimeInputs = false;
+        }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -125,12 +253,24 @@ internal sealed class MainForm : Form
         }
 
         SetBusy(true);
-        SetStatus("Clipping…", MutedTextColor);
+        SetStatus("Downloading preview…", MutedTextColor);
 
         try
         {
-            var outputPath = await ClipperRunner.CreateMp3Async(url, mediaId, start, end);
-            SetStatus($"Saved {Path.GetFileName(outputPath)}", SuccessColor);
+            using var draft = await ClipperRunner.CreateDraftAsync(url, mediaId, start, end);
+            SetBusy(false);
+            SetStatus("Preview ready. Fine-tune it before saving.", MutedTextColor);
+
+            using var trimForm = new TrimForm(draft);
+            if (trimForm.ShowDialog(this) == DialogResult.OK
+                && trimForm.SavedPath is not null)
+            {
+                SetStatus($"Saved {Path.GetFileName(trimForm.SavedPath)}", SuccessColor);
+            }
+            else
+            {
+                SetStatus("Preview discarded.", MutedTextColor);
+            }
         }
         catch (Exception exception)
         {
@@ -153,7 +293,7 @@ internal sealed class MainForm : Form
         start = default;
         end = default;
 
-        if (!TryGetTwitchMedia(_urlTextBox.Text, out url, out mediaId))
+        if (!TryGetTwitchMedia(_urlTextBox.Text, out url, out mediaId, out _))
         {
             SetStatus("Enter a public Twitch VOD or clip link.", ErrorColor);
             _urlTextBox.Focus();
@@ -162,11 +302,17 @@ internal sealed class MainForm : Form
 
         ValidateChildren();
         start = _startTimeInput.Value;
-        end = _endTimeInput.Value;
+        end = _useDurationCheckBox.Checked
+            ? start + _endTimeInput.Value
+            : _endTimeInput.Value;
 
         if (end <= start)
         {
-            SetStatus("End time must be after start time.", ErrorColor);
+            SetStatus(
+                _useDurationCheckBox.Checked
+                    ? "Duration must be longer than zero."
+                    : "End time must be after start time.",
+                ErrorColor);
             _endTimeInput.FocusFirstField();
             return false;
         }
@@ -174,10 +320,15 @@ internal sealed class MainForm : Form
         return true;
     }
 
-    private static bool TryGetTwitchMedia(string value, out string url, out string mediaId)
+    private static bool TryGetTwitchMedia(
+        string value,
+        out string url,
+        out string mediaId,
+        out TimeSpan? linkedStart)
     {
         url = string.Empty;
         mediaId = string.Empty;
+        linkedStart = null;
 
         if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri)
             || uri.Scheme != Uri.UriSchemeHttps
@@ -198,6 +349,7 @@ internal sealed class MainForm : Form
         {
             mediaId = pathParts[1];
             url = $"https://www.twitch.tv/videos/{mediaId}";
+            linkedStart = TryGetLinkedStart(uri);
             return true;
         }
 
@@ -224,6 +376,24 @@ internal sealed class MainForm : Form
         return false;
     }
 
+    private static TimeSpan? TryGetLinkedStart(Uri uri)
+    {
+        foreach (var queryPart in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var keyValue = queryPart.Split('=', 2);
+            if (keyValue.Length == 2
+                && keyValue[0].Equals("t", StringComparison.OrdinalIgnoreCase)
+                && TimestampText.TryParseTwitchOffset(
+                    Uri.UnescapeDataString(keyValue[1]),
+                    out var timestamp))
+            {
+                return timestamp;
+            }
+        }
+
+        return null;
+    }
+
     private static bool IsMainTwitchHost(string host) =>
         host.Equals("twitch.tv", StringComparison.OrdinalIgnoreCase)
         || host.Equals("www.twitch.tv", StringComparison.OrdinalIgnoreCase)
@@ -243,8 +413,9 @@ internal sealed class MainForm : Form
         _urlTextBox.Enabled = !busy;
         _startTimeInput.Enabled = !busy;
         _endTimeInput.Enabled = !busy;
+        _useDurationCheckBox.Enabled = !busy;
         _clipButton.Enabled = !busy;
-        _clipButton.Text = busy ? "Clipping…" : "Clip MP3";
+        _clipButton.Text = busy ? "Downloading…" : "Download & trim";
         UseWaitCursor = busy;
     }
 
